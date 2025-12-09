@@ -1,0 +1,489 @@
+import os
+from typing import Optional
+
+import streamlit as st
+from openai import OpenAI
+
+from moviepy.editor import (
+    AudioFileClip,
+    CompositeVideoClip,
+    ColorClip,
+    ImageClip,
+)
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageColor
+
+# =========================
+# OpenAI 클라이언트 설정
+# =========================
+api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+
+if not api_key:
+    st.error(
+        "OPENAI_API_KEY 가 설정되어 있지 않습니다.\n\n"
+        "- Streamlit Cloud의 'Edit secrets'에서\n"
+        '  OPENAI_API_KEY = "sk-..." 형식으로 추가해 주세요.'
+    )
+    st.stop()
+
+client = OpenAI(api_key=api_key)
+
+# 폰트 (레포 루트에 NanumGothic.ttf 파일이 있다고 가정)
+FONT_PATH = os.path.join(os.path.dirname(__file__), "NanumGothic.ttf")
+
+
+# ====================================
+# 0) Pillow로 자막 이미지를 만드는 함수
+# ====================================
+def load_font(font_size: int) -> ImageFont.FreeTypeFont:
+    """항상 나눔고딕을 우선 사용 (없으면 기본 폰트)."""
+    if os.path.isfile(FONT_PATH):
+        try:
+            return ImageFont.truetype(FONT_PATH, font_size)
+        except Exception:
+            pass
+    # 폴백
+    try:
+        return ImageFont.truetype("arial.ttf", font_size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def hex_to_rgb(color_hex: str):
+    """#RRGGBB 형태를 (R,G,B) 튜플로 변환."""
+    try:
+        return ImageColor.getrgb(color_hex)
+    except Exception:
+        return (255, 255, 255)
+
+
+def make_subtitle_image(
+    text: str,
+    width: int,
+    font_size: int,
+    text_color_hex: str,
+    outline_color_hex: str,
+    outline_width: int,
+):
+    """
+    Pillow를 이용해 자막용 텍스트 이미지를 생성.
+    폭(width)에 맞게 자동 줄바꿈하고, 중앙 정렬.
+    """
+    if not text:
+        text = " "
+
+    font = load_font(font_size)
+    text_color = hex_to_rgb(text_color_hex)
+    outline_color = hex_to_rgb(outline_color_hex)
+
+    dummy_img = Image.new("RGBA", (width, font_size * 4), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(dummy_img)
+
+    words = text.split(" ")
+    lines = []
+    current_line = ""
+    for w in words:
+        trial = (current_line + " " + w).strip()
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        line_width = bbox[2] - bbox[0]
+        if line_width <= width:
+            current_line = trial
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = w
+    if current_line:
+        lines.append(current_line)
+
+    line_height = font_size + 8
+    img_height = line_height * len(lines)
+
+    img = Image.new("RGBA", (width, img_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    y = 0
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_width = bbox[2] - bbox[0]
+        x = (width - line_width) // 2
+
+        # 외곽선
+        if outline_width > 0:
+            for dx in range(-outline_width, outline_width + 1):
+                for dy in range(-outline_width, outline_width + 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    draw.text((x + dx, y + dy), line, font=font, fill=outline_color)
+
+        # 본 텍스트
+        draw.text((x, y), line, font=font, fill=text_color)
+        y += line_height
+
+    return img
+
+
+# ====================================
+# 1) 텍스트 -> 음성 (OpenAI TTS)
+# ====================================
+def generate_tts(text: str, output_path: str = "tts_audio.mp3") -> str:
+    """
+    텍스트를 OpenAI TTS로 mp3 파일로 저장.
+    """
+    response = client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=text,
+    )
+
+    audio_bytes = response.read()
+
+    with open(output_path, "wb") as f:
+        f.write(audio_bytes)
+
+    return output_path
+
+
+# ====================================
+# 2) 음성 -> 타임스탬프 (Whisper)
+# ====================================
+def extract_word_timestamps(audio_path: str):
+    """
+    Whisper(whisper-1)로 단어 단위 타임스탬프 추출.
+    """
+    with open(audio_path, "rb") as audio_file:
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            response_format="verbose_json",
+            timestamp_granularities=["word"],
+        )
+
+    words = getattr(transcript, "words", None)
+    if words is None and isinstance(transcript, dict):
+        words = transcript.get("words", [])
+
+    if words is None:
+        words = []
+
+    return words
+
+
+# ====================================
+# 3-A) 단어 리스트를 더 긴 자막 덩어리로 그룹핑
+# ====================================
+def normalize_words(words):
+    """Whisper 결과를 dict 리스트로 정규화."""
+    norm = []
+    for w in words:
+        if hasattr(w, "word"):
+            norm.append({"word": w.word, "start": w.start, "end": w.end})
+        else:
+            norm.append(
+                {"word": w["word"], "start": w["start"], "end": w["end"]}
+            )
+    return norm
+
+
+def group_words_to_chunks(
+    words,
+    min_duration: float = 1.2,  # 최소 자막 유지 시간(초)
+    max_chars: int = 25,        # 한 자막 블록의 최대 글자 수
+):
+    """
+    너무 자주 바뀌지 않도록 단어들을 묶어서 한 블록으로 만드는 함수.
+    """
+    words = normalize_words(words)
+    chunks = []
+    current_text = ""
+    current_start: Optional[float] = None
+    current_end: Optional[float] = None
+
+    for w in words:
+        word = w["word"]
+        start = w["start"]
+        end = w["end"]
+
+        if current_text == "":
+            current_text = word
+            current_start = start
+            current_end = end
+        else:
+            trial = current_text + " " + word
+            trial_len = len(trial)
+            duration = end - (current_start if current_start is not None else start)
+
+            if duration >= min_duration or trial_len > max_chars:
+                chunks.append(
+                    {
+                        "text": current_text,
+                        "start": current_start,
+                        "end": current_end,
+                    }
+                )
+                current_text = word
+                current_start = start
+                current_end = end
+            else:
+                current_text = trial
+                current_end = end
+
+    if current_text and current_start is not None and current_end is not None:
+        chunks.append(
+            {"text": current_text, "start": current_start, "end": current_end}
+        )
+
+    return chunks
+
+
+# ====================================
+# 3-B) 타임스탬프 기반 자막 + 배경 클립 생성
+# ====================================
+def build_video_clips_from_chunks(
+    chunks,
+    video_size=(1080, 1920),
+    font_size: int = 70,
+    text_color_hex: str = "#FFFFFF",
+    outline_color_hex: str = "#000000",
+    outline_width: int = 3,
+    y_ratio: float = 0.8,  # 0.0(맨 위) ~ 1.0(맨 아래)
+):
+    """
+    자막 블록(chunks) 리스트로부터 자막 이미지 클립 + 배경 클립 생성.
+    """
+    W, H = video_size
+    clips = []
+
+    if not chunks:
+        return clips, 0.0
+
+    last_end = max(c["end"] for c in chunks)
+
+    bg = ColorClip(size=(W, H), color=(0, 0, 0), duration=last_end)
+    clips.append(bg)
+
+    y_pos = int(H * y_ratio)
+
+    for c in chunks:
+        txt = c["text"]
+        start = c["start"]
+        end = c["end"]
+        if end <= start:
+            continue
+        duration = end - start
+
+        img = make_subtitle_image(
+            txt,
+            width=W - 200,
+            font_size=font_size,
+            text_color_hex=text_color_hex,
+            outline_color_hex=outline_color_hex,
+            outline_width=outline_width,
+        )
+
+        img_array = np.array(img)
+        text_clip = (
+            ImageClip(img_array)
+            .set_duration(duration)
+            .set_start(start)
+            .set_position(("center", y_pos))
+        )
+
+        clips.append(text_clip)
+
+    return clips, last_end
+
+
+# ====================================
+# 4) 음성 + 자막 -> mp4 영상 만들기
+# ====================================
+def create_video_with_subtitles(
+    audio_path: str,
+    words,
+    video_size=(1080, 1920),
+    font_size: int = 70,
+    text_color_hex: str = "#FFFFFF",
+    outline_color_hex: str = "#000000",
+    outline_width: int = 3,
+    y_ratio: float = 0.8,
+    output_path: str = "subking_result.mp4",
+):
+    chunks = group_words_to_chunks(words)
+    clips, duration = build_video_clips_from_chunks(
+        chunks,
+        video_size=video_size,
+        font_size=font_size,
+        text_color_hex=text_color_hex,
+        outline_color_hex=outline_color_hex,
+        outline_width=outline_width,
+        y_ratio=y_ratio,
+    )
+    if duration <= 0:
+        return None
+
+    video = CompositeVideoClip(clips)
+    audio = AudioFileClip(audio_path)
+    video = video.set_audio(audio)
+
+    video.write_videofile(
+        output_path,
+        fps=30,
+        codec="libx264",
+        audio_codec="aac",
+        verbose=False,
+        logger=None,
+    )
+
+    return output_path
+
+
+# ====================================
+# 5) 미리보기 이미지 생성 (Streamlit UI용)
+# ====================================
+def create_preview_frame(
+    video_size=(1080, 1920),
+    font_size: int = 70,
+    text_color_hex: str = "#FFFFFF",
+    outline_color_hex: str = "#000000",
+    outline_width: int = 3,
+    y_ratio: float = 0.8,
+    sample_text: str = "여기서는 자막이 올라갑니다",
+):
+    W, H = video_size
+
+    bg = Image.new("RGB", (W, H), (0, 0, 0))
+
+    subtitle_img = make_subtitle_image(
+        sample_text,
+        width=W - 200,
+        font_size=font_size,
+        text_color_hex=text_color_hex,
+        outline_color_hex=outline_color_hex,
+        outline_width=outline_width,
+    )
+
+    sw, sh = subtitle_img.size
+    y_pos = int(H * y_ratio) - sh // 2
+    x_pos = (W - sw) // 2
+
+    bg.paste(subtitle_img, (x_pos, y_pos), subtitle_img)
+
+    # 50% 크기로 축소 (사이드바 폭에 맞도록)
+    preview = bg.resize((W // 2, H // 2), Image.LANCZOS)
+    return preview
+
+
+# ====================================
+# 6) Streamlit UI
+# ====================================
+st.set_page_config(page_title="SubKing", page_icon="🎬", layout="wide")
+
+# ---------- 왼쪽 사이드바 ----------
+side = st.sidebar
+side.title("⚙️ SubKing 설정")
+
+# 영상 비율 선택
+ratio_label = side.radio(
+    "영상 비율 선택",
+    ("9:16 쇼츠 (1080x1920)", "16:9 롤폼 (1920x1080)"),
+)
+
+if "9:16" in ratio_label:
+    video_size = (1080, 1920)
+else:
+    video_size = (1920, 1080)
+
+side.markdown("---")
+
+# 자막 스타일 설정
+side.subheader("🎨 자막 스타일")
+
+font_size = side.slider(
+    "자막 폰트 크기", min_value=40, max_value=120, value=80, step=2
+)
+text_color = side.color_picker("자막 글자 색상", "#FFFFFF")
+
+outline_width = side.slider(
+    "텍스트 외곽선 두께", min_value=0, max_value=8, value=4
+)
+outline_color = side.color_picker("외곽선 색상", "#000000")
+
+pos_percent = side.slider(
+    "자막 세로 위치 (0 = 맨 위, 100 = 맨 아래)",
+    min_value=50,
+    max_value=95,
+    value=80,
+)
+y_ratio = pos_percent / 100.0
+
+side.markdown("---")
+
+# 자막 스타일 미리보기 (사이드바 폭에 맞게)
+side.subheader("👀 자막 미리보기")
+preview_img = create_preview_frame(
+    video_size=video_size,
+    font_size=font_size,
+    text_color_hex=text_color,
+    outline_color_hex=outline_color,
+    outline_width=outline_width,
+    y_ratio=y_ratio,
+    sample_text="여기서는 자막이 올라갑니다",
+)
+side.image(preview_img, use_container_width=True, caption="현재 설정 미리보기")
+
+# ---------- 메인 영역 ----------
+st.title("🎬 SubKing - 텍스트로 음성 + 자막 영상 만들기")
+
+script = st.text_area(
+    "🎧 음성으로 읽어 줄 대본을 입력하세요",
+    height=300,
+    placeholder="여기에 읽어 줄 문장을 입력해 주세요.",
+)
+
+if st.button("🎤 음성 + 자막 영상 생성"):
+    if not script.strip():
+        st.error("대본을 먼저 입력해 주세요.")
+        st.stop()
+
+    with st.status("TTS 생성 중...", expanded=True) as status:
+        audio_path = generate_tts(script)
+        status.update(label="타임스탬프 분석 중 (Whisper)...", state="running")
+
+        words = extract_word_timestamps(audio_path)
+        if not words:
+            status.update(
+                label="타임스탬프 결과가 비어 있습니다. 텍스트를 다시 확인해 주세요.",
+                state="error",
+            )
+            st.stop()
+
+        status.update(label="영상 렌더링 중 (MoviePy)...", state="running")
+
+        video_path = create_video_with_subtitles(
+            audio_path=audio_path,
+            words=words,
+            video_size=video_size,
+            font_size=font_size,
+            text_color_hex=text_color,
+            outline_color_hex=outline_color,
+            outline_width=outline_width,
+            y_ratio=y_ratio,
+            output_path="subking_result.mp4",
+        )
+
+        if not video_path:
+            status.update(label="영상 생성에 실패했습니다.", state="error")
+            st.stop()
+
+        status.update(label="완료! 🎉", state="complete")
+
+    st.success("영상이 생성되었습니다.")
+    st.video(video_path)
+
+    with open(video_path, "rb") as f:
+        st.download_button(
+            "📥 영상 다운로드",
+            f,
+            file_name="subking_result.mp4",
+            mime="video/mp4",
+        )
