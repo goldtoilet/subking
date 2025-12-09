@@ -14,6 +14,16 @@ from moviepy.editor import (
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 
+# ====================================
+# 페이지 설정 (사이드바 항상 펼쳐두기!!)
+# ====================================
+st.set_page_config(
+    page_title="SubKing",
+    page_icon="🎬",
+    layout="wide",
+    initial_sidebar_state="expanded",  # ← 이 부분이 핵심
+)
+
 # =========================
 # OpenAI 클라이언트 설정
 # =========================
@@ -368,7 +378,6 @@ def create_preview_frame(
 
     bg.paste(subtitle_img, (x_pos, y_pos), subtitle_img)
 
-    # 50% 크기로 축소 (사이드바 폭에 맞도록)
     preview = bg.resize((W // 2, H // 2), Image.LANCZOS)
     return preview
 
@@ -376,7 +385,6 @@ def create_preview_frame(
 # ====================================
 # 6) Streamlit UI
 # ====================================
-st.set_page_config(page_title="SubKing", page_icon="🎬", layout="wide")
 
 # ---------- 왼쪽 사이드바 ----------
 side = st.sidebar
@@ -418,7 +426,7 @@ y_ratio = pos_percent / 100.0
 
 side.markdown("---")
 
-# 자막 스타일 미리보기 (사이드바 폭에 맞게)
+# 자막 스타일 미리보기
 side.subheader("👀 자막 미리보기")
 preview_img = create_preview_frame(
     video_size=video_size,
