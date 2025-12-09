@@ -82,24 +82,32 @@ def build_subtitles(text, cps=8.0, min_dur=1.5, gap=0.2, max_chars=28):
 # =========================
 # 4. 무료 모델용 ElevenLabs TTS
 # =========================
+from elevenlabs.core.api_error import ApiError   # 맨 위 import 구역에 추가되어 있어야 함
+
 def tts_free(text, voice_id):
-    """무료 플랜에서도 항상 돌아가는 TTS"""
+    """무료 플랜에서도 TTS 호출. 에러 내용을 화면에 그대로 보여줌."""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
     tmp.close()
     out_path = tmp.name
 
-    response = client.text_to_speech.convert(
-        text=text,
-        voice_id=voice_id,
-        model_id="eleven_monolingual_v1",   # 무료 계정 전용 안전 모델
-        output_format="mp3_44100_64",
-        voice_settings=VoiceSettings(
-            stability=0.5,
-            similarity_boost=0.8,
-            style=0.0,
-            use_speaker_boost=False,   # 무료 계정에서 제한될 수 있어 비활성화
-        ),
-    )
+    try:
+        response = client.text_to_speech.convert(
+            text=text,
+            voice_id=voice_id,
+            model_id="eleven_monolingual_v1",   # 무료 모델
+            output_format="mp3_44100_64",
+            voice_settings=VoiceSettings(
+                stability=0.5,
+                similarity_boost=0.8,
+                style=0.0,
+                use_speaker_boost=False,
+            ),
+        )
+    except ApiError as e:
+        # 🔴 여기서 진짜 이유를 Streamlit 화면에 표시
+        st.error(f"ElevenLabs API 오류: {e}")
+        # 더 이상 진행하지 않고 멈춤
+        raise
 
     with open(out_path, "wb") as f:
         for chunk in response:
