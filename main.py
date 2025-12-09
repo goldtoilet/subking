@@ -1,7 +1,14 @@
 import os
 import streamlit as st
 from openai import OpenAI
-from moviepy.editor import AudioFileClip, TextClip, CompositeVideoClip, ColorClip
+from moviepy.editor import (
+    AudioFileClip,
+    CompositeVideoClip,
+    ColorClip,
+    ImageClip,
+)
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 # =========================
 # OpenAI 클라이언트 설정
@@ -23,12 +30,90 @@ FONT_PATH = os.path.join(os.path.dirname(__file__), "NanumGothic.ttf")
 
 
 # ====================================
+# 0) Pillow로 자막 이미지를 만드는 함수
+# ====================================
+def make_subtitle_image(
+    text: str,
+    width: int,
+    font_size: int = 70,
+    font_path: str | None = None,
+    text_color=(255, 255, 255),
+    outline_color=(0, 0, 0),
+    outline_width: int = 3,
+):
+    """
+    Pillow를 이용해 자막용 텍스트 이미지를 생성.
+    폭(width)에 맞게 자동 줄바꿈하고, 중앙 정렬.
+    """
+    if not text:
+        text = " "
+
+    # 폰트 로드
+    try:
+        if font_path and os.path.isfile(font_path):
+            font = ImageFont.truetype(font_path, font_size)
+        else:
+            font = ImageFont.truetype("arial.ttf", font_size)
+    except Exception:
+        font = ImageFont.load_default()
+
+    # 먼저 큰 캔버스에 그려서 높이 계산
+    dummy_img = Image.new("RGBA", (width, font_size * 4), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(dummy_img)
+
+    # 간단한 수동 줄바꿈
+    words = text.split(" ")
+    lines = []
+    current_line = ""
+    for w in words:
+        trial = (current_line + " " + w).strip()
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        line_width = bbox[2] - bbox[0]
+        if line_width <= width:
+            current_line = trial
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = w
+    if current_line:
+        lines.append(current_line)
+
+    # 전체 높이 계산
+    line_height = font_size + 8
+    img_height = line_height * len(lines)
+
+    img = Image.new("RGBA", (width, img_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    y = 0
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_width = bbox[2] - bbox[0]
+
+        x = (width - line_width) // 2
+
+        # 외곽선
+        if outline_width > 0:
+            for dx in range(-outline_width, outline_width + 1):
+                for dy in range(-outline_width, outline_width + 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    draw.text((x + dx, y + dy), line, font=font, fill=outline_color)
+
+        # 본 텍스트
+        draw.text((x, y), line, font=font, fill=text_color)
+
+        y += line_height
+
+    return img
+
+
+# ====================================
 # 1) 텍스트 -> 음성 (OpenAI TTS)
 # ====================================
 def generate_tts(text: str, output_path: str = "tts_audio.mp3") -> str:
     """
     텍스트를 OpenAI TTS로 mp3 파일로 저장.
-    format 파라미터는 사용하지 않고, 응답 bytes 그대로 저장.
     """
     response = client.audio.speech.create(
         model="gpt-4o-mini-tts",
@@ -36,7 +121,6 @@ def generate_tts(text: str, output_path: str = "tts_audio.mp3") -> str:
         input=text,
     )
 
-    # 응답 객체에서 raw bytes 읽기
     audio_bytes = response.read()
 
     with open(output_path, "wb") as f:
@@ -60,7 +144,6 @@ def extract_word_timestamps(audio_path: str):
             timestamp_granularities=["word"],
         )
 
-    # SDK 버전에 따라 pydantic 객체 / dict 둘 다 대응
     words = getattr(transcript, "words", None)
     if words is None and isinstance(transcript, dict):
         words = transcript.get("words", [])
@@ -76,7 +159,7 @@ def extract_word_timestamps(audio_path: str):
 # ====================================
 def build_video_clips_from_words(words, video_size=(1080, 1920)):
     """
-    Whisper 단어 리스트로부터 자막 텍스트 클립 + 배경 클립 생성.
+    Whisper 단어 리스트로부터 자막 이미지 클립 + 배경 클립 생성.
     """
     W, H = video_size
     clips = []
@@ -84,14 +167,12 @@ def build_video_clips_from_words(words, video_size=(1080, 1920)):
     if not words:
         return clips, 0.0
 
-    # 전체 길이
     last_end = max((w.end if hasattr(w, "end") else w["end"]) for w in words)
 
     # 배경(검정 화면)
     bg = ColorClip(size=(W, H), color=(0, 0, 0), duration=last_end)
     clips.append(bg)
 
-    # 각 단어별 자막 클립
     for w in words:
         if hasattr(w, "word"):
             txt = w.word
@@ -105,23 +186,22 @@ def build_video_clips_from_words(words, video_size=(1080, 1920)):
         if end <= start:
             continue
 
-        # 폰트 경로가 있으면 사용, 없으면 시스템 기본 폰트
-        font_arg = FONT_PATH if os.path.isfile(FONT_PATH) else "Arial-Bold"
+        duration = end - start
 
+        # Pillow로 자막 이미지 생성
+        img = make_subtitle_image(
+            txt,
+            width=W - 200,
+            font_size=70,
+            font_path=FONT_PATH if os.path.isfile(FONT_PATH) else None,
+        )
+
+        img_array = np.array(img)
         text_clip = (
-            TextClip(
-                txt,
-                font=font_arg,
-                fontsize=70,
-                color="white",
-                stroke_color="black",
-                stroke_width=3,
-                method="caption",
-                size=(W - 200, None),
-            )
-            .set_position(("center", H - 300))
+            ImageClip(img_array)
+            .set_duration(duration)
             .set_start(start)
-            .set_duration(end - start)
+            .set_position(("center", H - 300))
         )
 
         clips.append(text_clip)
@@ -143,7 +223,6 @@ def create_video_with_subtitles(
     audio = AudioFileClip(audio_path)
     video = video.set_audio(audio)
 
-    # mp4로 렌더링
     video.write_videofile(
         output_path,
         fps=30,
