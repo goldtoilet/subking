@@ -427,7 +427,7 @@ def create_video_with_subtitles(
         return None
 
     # 제목 클립 추가
-    if any(line.strip() for line in title_lines):
+    if any((line or "").strip() for line in title_lines):
         title_clips = build_title_clips(
             title_lines=title_lines,
             video_size=video_size,
@@ -459,39 +459,93 @@ def create_video_with_subtitles(
 
 
 # ====================================
-# 5) 미리보기 이미지 생성 (Streamlit UI용)
+# 5) 미리보기 이미지 생성 (제목 + 자막) (Streamlit UI용)
 # ====================================
 def create_preview_frame(
     video_size=(1080, 1920),
-    font_size: int = 70,
-    text_color_hex: str = "#FFFFFF",
-    outline_color_hex: str = "#000000",
-    outline_width: int = 3,
-    y_ratio: float = 0.8,
-    sample_text: str = "여기서는 자막이 올라갑니다",
+    # 자막 스타일
+    sub_font_size: int = 70,
+    sub_text_color_hex: str = "#FFFFFF",
+    sub_outline_color_hex: str = "#000000",
+    sub_outline_width: int = 3,
+    sub_y_ratio: float = 0.8,
+    sub_sample_text: str = "여기서는 자막이 올라갑니다",
+    # 제목 스타일
+    title_font_size: int = 80,
+    title_outline_width: int = 4,
+    title_line_spacing: int = 10,
+    title_top_ratio: float = 0.1,
+    title_lines=None,
+    title_text_colors=None,
+    title_outline_colors=None,
+    title_aligns=None,
 ):
-    W, H = video_size
+    """
+    제목(4줄) + 자막 샘플을 모두 포함한 미리보기 프레임 생성.
+    실제 영상 비율에 맞추고, 최종적으로 1/5 크기로 축소.
+    """
+    if title_lines is None:
+        title_lines = []
+    if title_text_colors is None:
+        title_text_colors = []
+    if title_outline_colors is None:
+        title_outline_colors = []
+    if title_aligns is None:
+        title_aligns = []
 
+    W, H = video_size
     bg = Image.new("RGB", (W, H), (0, 0, 0))
 
+    # 1) 제목 부분
+    safe_width = W - 200
+    y = int(H * title_top_ratio)
+
+    for idx, line in enumerate(title_lines):
+        if not line:
+            continue
+
+        text_color = title_text_colors[idx] if idx < len(title_text_colors) else "#FFFFFF"
+        outline_color = title_outline_colors[idx] if idx < len(title_outline_colors) else "#000000"
+        align = title_aligns[idx] if idx < len(title_aligns) else "center"
+
+        img = make_text_image(
+            line,
+            width=safe_width,
+            font_size=title_font_size,
+            text_color_hex=text_color,
+            outline_color_hex=outline_color,
+            outline_width=title_outline_width,
+            line_spacing=title_line_spacing,
+            align=align,
+        )
+
+        w, h = img.size
+        x = (W - w) // 2
+        bg.paste(img, (x, y), img)
+        y += title_font_size + title_line_spacing
+
+    # 2) 자막 부분
     subtitle_img = make_text_image(
-        sample_text,
+        sub_sample_text,
         width=W - 200,
-        font_size=font_size,
-        text_color_hex=text_color_hex,
-        outline_color_hex=outline_color_hex,
-        outline_width=outline_width,
+        font_size=sub_font_size,
+        text_color_hex=sub_text_color_hex,
+        outline_color_hex=sub_outline_color_hex,
+        outline_width=sub_outline_width,
         line_spacing=8,
         align="center",
     )
 
     sw, sh = subtitle_img.size
-    y_pos = int(H * y_ratio) - sh // 2
+    y_pos = int(H * sub_y_ratio) - sh // 2
     x_pos = (W - sw) // 2
 
     bg.paste(subtitle_img, (x_pos, y_pos), subtitle_img)
 
-    preview = bg.resize((W // 2, H // 2), Image.LANCZOS)
+    # 3) 전체 프레임을 1/5 크기로 축소
+    scale = 0.2  # 1/5
+    preview_size = (int(W * scale), int(H * scale))
+    preview = bg.resize(preview_size, Image.LANCZOS)
     return preview
 
 
@@ -506,7 +560,7 @@ side.title("⚙️ SubKing 설정")
 # 영상 비율 선택
 ratio_label = side.radio(
     "영상 비율 선택",
-    ("9:16 쇼츠 (1080x1920)", "16:9 롤폼 (1920x1080)"),
+    ("9:16 쇼츠 (1080x1920)", "16:9 롱폼 (1920x1080)"),
 )
 
 if "9:16" in ratio_label:
@@ -536,36 +590,23 @@ side.markdown("---")
 
 # 자막 스타일 (Disclosure / Expander)
 with side.expander("🎨 자막 스타일", expanded=True):
-    font_size = st.slider(
+    sub_font_size = st.slider(
         "자막 폰트 크기", min_value=40, max_value=120, value=80, step=2
     )
-    text_color = st.color_picker("자막 글자 색상", "#FFFFFF")
+    sub_text_color = st.color_picker("자막 글자 색상", "#FFFFFF")
 
-    outline_width = st.slider(
+    sub_outline_width = st.slider(
         "텍스트 외곽선 두께", min_value=0, max_value=8, value=4
     )
-    outline_color = st.color_picker("외곽선 색상", "#000000")
+    sub_outline_color = st.color_picker("외곽선 색상", "#000000")
 
-    pos_percent = st.slider(
+    sub_pos_percent = st.slider(
         "자막 세로 위치 (0 = 맨 위, 100 = 맨 아래)",
         min_value=50,
         max_value=95,
         value=80,
     )
-    y_ratio = pos_percent / 100.0
-
-    st.markdown("---")
-    st.subheader("👀 자막 미리보기")
-    preview_img = create_preview_frame(
-        video_size=video_size,
-        font_size=font_size,
-        text_color_hex=text_color,
-        outline_color_hex=outline_color,
-        outline_width=outline_width,
-        y_ratio=y_ratio,
-        sample_text="여기서는 자막이 올라갑니다",
-    )
-    st.image(preview_img, use_container_width=True, caption="현재 자막 설정 미리보기")
+    sub_y_ratio = sub_pos_percent / 100.0
 
 # 제목 스타일 (Disclosure / Expander)
 with side.expander("📝 제목 스타일", expanded=False):
@@ -591,6 +632,13 @@ with side.expander("📝 제목 스타일", expanded=False):
     st.markdown("---")
     st.markdown("**제목 텍스트 & 각 줄 스타일**")
 
+    default_samples = [
+        "여기는 첫째줄",
+        "여기는 둘째줄",
+        "여기는 셋째줄",
+        "여기는 넷째줄",
+    ]
+
     title_lines = []
     title_aligns = []
     title_text_colors = []
@@ -601,7 +649,9 @@ with side.expander("📝 제목 스타일", expanded=False):
     for i in range(4):
         st.markdown(f"**제목 {i+1} 줄**")
         line = st.text_input(
-            f"제목 {i+1} 줄 내용", key=f"title_line_{i+1}", placeholder="비워두면 사용하지 않습니다."
+            f"제목 {i+1} 줄 내용",
+            key=f"title_line_{i+1}",
+            value=default_samples[i],
         )
         align_label = st.selectbox(
             f"정렬 (제목 {i+1} 줄)",
@@ -628,10 +678,53 @@ st.title("🎬 SubKing - 텍스트로 음성 + 자막 영상 만들기")
 
 script = st.text_area(
     "🎧 음성으로 읽어 줄 대본을 입력하세요",
-    height=300,
+    height=100,  # 원래 300 → 1/3 정도로 축소
     placeholder="여기에 읽어 줄 문장을 입력해 주세요.",
 )
 
+# ---- 미리보기 (제목 + 자막) ----
+st.markdown("### 🔍 미리보기 (제목 + 자막 스타일)")
+
+# 미리보기용 제목 텍스트는,
+# 실제 입력값이 비어 있으면 샘플 텍스트로 대체
+preview_title_lines = []
+default_samples = [
+    "여기는 첫째줄",
+    "여기는 둘째줄",
+    "여기는 셋째줄",
+    "여기는 넷째줄",
+]
+for i, line in enumerate(title_lines):
+    if line and line.strip():
+        preview_title_lines.append(line)
+    else:
+        preview_title_lines.append(default_samples[i])
+
+preview_img = create_preview_frame(
+    video_size=video_size,
+    # 자막 스타일
+    sub_font_size=sub_font_size,
+    sub_text_color_hex=sub_text_color,
+    sub_outline_color_hex=sub_outline_color,
+    sub_outline_width=sub_outline_width,
+    sub_y_ratio=sub_y_ratio,
+    sub_sample_text="여기서는 자막이 올라갑니다",
+    # 제목 스타일
+    title_font_size=title_font_size,
+    title_outline_width=title_outline_width,
+    title_line_spacing=title_line_spacing,
+    title_top_ratio=title_top_ratio,
+    title_lines=preview_title_lines,
+    title_text_colors=title_text_colors,
+    title_outline_colors=title_outline_colors,
+    title_aligns=title_aligns,
+)
+
+st.image(preview_img, caption="현재 제목 + 자막 스타일 미리보기", use_container_width=False)
+
+st.markdown("---")
+
+# ---- 영상 생성 버튼 ----
 if st.button("🎤 음성 + 자막 영상 생성"):
     if not script.strip():
         st.error("대본을 먼저 입력해 주세요.")
@@ -655,13 +748,13 @@ if st.button("🎤 음성 + 자막 영상 생성"):
             audio_path=audio_path,
             words=words,
             video_size=video_size,
-            font_size=font_size,
-            text_color_hex=text_color,
-            outline_color_hex=outline_color,
-            outline_width=outline_width,
-            y_ratio=y_ratio,
+            font_size=sub_font_size,
+            text_color_hex=sub_text_color,
+            outline_color_hex=sub_outline_color,
+            outline_width=sub_outline_width,
+            y_ratio=sub_y_ratio,
             output_path="subking_result.mp4",
-            # 제목 옵션 전달
+            # 제목 옵션 전달 (실제 영상에서는 빈 줄은 그대로 비워둠)
             title_lines=title_lines,
             title_aligns=title_aligns,
             title_text_colors=title_text_colors,
