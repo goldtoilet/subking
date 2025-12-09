@@ -1,6 +1,7 @@
 openai>=1.54.0
 streamlit>=1.39.0
-moviepy>=1.0.3
+
+moviepy==1.0.3
 imageio-ffmpeg>=0.4.9
 Pillow
 numpy
