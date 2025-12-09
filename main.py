@@ -4,145 +4,51 @@ import tempfile
 from pathlib import Path
 
 import streamlit as st
-from openai import OpenAI
-from moviepy.editor import AudioFileClip, VideoClip
 import numpy as np
+from moviepy.editor import AudioFileClip, VideoClip
 from PIL import Image, ImageDraw, ImageFont
 
-# =========================
-# OpenAI 설정
-# =========================
-API_KEY = os.getenv("GPT_API_KEY") or st.secrets.get("GPT_API_KEY", None)
+from elevenlabs.client import ElevenLabs
+from elevenlabs import VoiceSettings
 
-if not API_KEY:
-    st.error("GPT_API_KEY 환경변수 또는 .streamlit/secrets.toml 에 GPT_API_KEY를 설정해주세요.")
+ELEVEN_API_KEY = (
+    os.getenv("ELEVENLABS_API_KEY")
+    or st.secrets.get("ELEVENLABS_API_KEY", None)
+)
+
+if not ELEVEN_API_KEY:
+    st.error("ELEVENLABS_API_KEY 환경변수 또는 secrets.toml 에 ELEVENLABS_API_KEY를 설정해 주세요.")
     st.stop()
 
-client = OpenAI(api_key=API_KEY)
+el_client = ElevenLabs(api_key=ELEVEN_API_KEY)
+
+VIDEO_WIDTH = 1080
+VIDEO_HEIGHT = 1920
 
 
-# =========================
-# 1. 대본 → 자막용 문장 리스트
-# =========================
-def split_script_to_segments(text: str, max_chars_per_sub: int = 28) -> list[str]:
-    """
-    '보통 사람이 쓰는 대본' 기준:
-      - 줄바꿈, 마침표(., ?, !, 。, ？, ！)를 기준으로 한 번 문장을 나누고
-      - 각 문장이 너무 길면 max_chars_per_sub 단위로 잘라서 여러 자막으로 만든다.
-    결과적으로 한 번에 한 문장(혹은 짧은 구절)만 자막에 뜨도록.
-    """
-    # 줄바꿈 + 문장부호 기준으로 1차 분리
-    raw_chunks = re.split(r'(?<=[\.!?。？！])\s+|\n+', text.strip())
-    segments = []
-
-    for chunk in raw_chunks:
-        chunk = chunk.strip()
-        if not chunk:
+def load_font(font_size: int) -> ImageFont.FreeTypeFont:
+    candidates = [
+        "NanumGothic.ttf",
+        "./NanumGothic.ttf",
+        "fonts/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, font_size)
+        except Exception:
             continue
-
-        # 너무 긴 문장은 max_chars_per_sub 길이로 다시 쪼갠다 (한국어라 공백 기준 말고 문자 길이 기준)
-        while len(chunk) > max_chars_per_sub:
-            segments.append(chunk[:max_chars_per_sub])
-            chunk = chunk[max_chars_per_sub:]
-        if chunk:
-            segments.append(chunk)
-
-    return segments
-
-
-def build_subtitles(
-    text: str,
-    chars_per_second: float = 8.0,
-    min_duration: float = 1.5,
-    gap_between_lines: float = 0.2,
-    max_chars_per_sub: int = 28,
-) -> list[dict]:
-    """
-    대본 전체 → 자막 리스트
-      - split_script_to_segments 로 잘게 쪼갠 문장들을 순서대로 배치
-      - 각 문장의 길이에 따라 자동으로 duration 계산
-    """
-    segments = split_script_to_segments(text, max_chars_per_sub=max_chars_per_sub)
-    subtitles = []
-    current_time = 0.0
-
-    for idx, seg in enumerate(segments, start=1):
-        seg_len = max(len(seg), 1)
-        dur = max(min_duration, seg_len / chars_per_second)
-        start = current_time
-        end = start + dur
-        subtitles.append(
-            {"index": idx, "start": start, "end": end, "text": seg}
-        )
-        current_time = end + gap_between_lines
-
-    return subtitles
-
-
-# =========================
-# 2. TTS (텍스트 → 음성)
-# =========================
-def generate_tts_audio(text: str, voice: str = "alloy", speed: float = 1.0) -> str:
-    """
-    ChatGPT TTS (gpt-4o-mini-tts)로 mp3 생성
-    voice: alloy, ash, ballad, coral, echo, fable, onyx, nova, sage, shimmer, verse
-    speed: 0.25 ~ 4.0
-    """
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    tmp.close()
-    out_path = Path(tmp.name)
-
-    with client.audio.speech.with_streaming_response.create(
-        model="gpt-4o-mini-tts",
-        voice=voice,
-        input=text,
-        speed=speed,
-    ) as response:
-        response.stream_to_file(out_path)
-
-    return str(out_path)
-
-
-# =========================
-# 3. PIL 기반 자막 렌더링
-# =========================
-def _load_font(font_size: int) -> ImageFont.FreeTypeFont:
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", font_size)
-    except Exception:
-        return ImageFont.load_default()
-
-
-def _wrap_text_to_width(draw, text, font, max_width: int) -> str:
-    """
-    가로폭 안에 들어가도록 여러 줄로 개행.
-    (한국어도 그냥 문자 단위로 잘라서 넣는 방식이라 충분히 무난하게 보인다)
-    """
-    words = list(text)  # 문자 단위로
-    if not words:
-        return ""
-
-    lines = []
-    current = words[0]
-    for ch in words[1:]:
-        test = current + ch
-        bbox = draw.textbbox((0, 0), test, font=font)
-        if bbox[2] - bbox[0] <= max_width:
-            current = test
-        else:
-            lines.append(current)
-            current = ch
-    lines.append(current)
-    return "\n".join(lines)
+    return ImageFont.load_default()
 
 
 def draw_subtitle_frame(
     text: str,
     video_width: int,
     video_height: int,
-    subtitle_fontsize: int,
-    subtitle_bottom_margin: int,
-    text_color: str,
+    font_size: int,
+    bottom_margin: int,
+    text_color,
     bg_color,
     max_text_width_ratio: float,
 ) -> Image.Image:
@@ -151,33 +57,138 @@ def draw_subtitle_frame(
         return img
 
     draw = ImageDraw.Draw(img)
-    font = _load_font(subtitle_fontsize)
+    font = load_font(font_size)
 
     max_text_width = int(video_width * max_text_width_ratio)
-    wrapped = _wrap_text_to_width(draw, text, font, max_text_width)
+
+    words = list(text)
+    if not words:
+        return img
+
+    lines = []
+    current = words[0]
+    for ch in words[1:]:
+        test = current + ch
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if bbox[2] - bbox[0] <= max_text_width:
+            current = test
+        else:
+            lines.append(current)
+            current = ch
+    lines.append(current)
+    wrapped = "\n".join(lines)
 
     bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, align="center")
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
 
     x = (video_width - text_w) // 2
-    y = video_height - subtitle_bottom_margin - text_h
+    y = video_height - bottom_margin - text_h
 
     draw.multiline_text((x, y), wrapped, font=font, fill=text_color, align="center")
     return img
 
 
-# =========================
-# 4. 자막 + 음성 → 영상
-# =========================
+def eleven_tts_to_mp3(text: str, voice_id: str, model_id: str, speed: float) -> str:
+    response = el_client.text_to_speech.convert(
+        voice_id=voice_id,
+        model_id=model_id,
+        output_format="mp3_44100_128",
+        text=text,
+        voice_settings=VoiceSettings(
+            stability=0.7,
+            similarity_boost=0.8,
+            style=0.2,
+            use_speaker_boost=True,
+            speed=speed,
+        ),
+    )
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tmp_path = tmp.name
+    tmp.close()
+
+    with open(tmp_path, "wb") as f:
+        for chunk in response:
+            if chunk:
+                f.write(chunk)
+
+    return tmp_path
+
+
+def eleven_stt_words_from_audio(audio_path: str, language_code: str = "kor"):
+    with open(audio_path, "rb") as f:
+        transcription = el_client.speech_to_text.convert(
+            file=f,
+            model_id="scribe_v1",
+            diarize=False,
+            tag_audio_events=False,
+            language_code=language_code,
+        )
+
+    if hasattr(transcription, "words"):
+        words = transcription.words
+    else:
+        words = transcription.get("words", [])
+    return words
+
+
+def build_sentence_segments_from_words(words):
+    segments = []
+    buf = []
+    start_time = None
+
+    def flush_segment(end_time):
+        nonlocal buf, start_time, segments
+        text = "".join(buf).strip()
+        if text:
+            segments.append(
+                {
+                    "index": len(segments) + 1,
+                    "start": float(start_time),
+                    "end": float(end_time),
+                    "text": text,
+                }
+            )
+        buf = []
+        start_time = None
+
+    for w in words:
+        w_type = w.get("type", "word")
+        t = w.get("text", "")
+        w_start = float(w.get("start", 0.0))
+        w_end = float(w.get("end", w_start))
+
+        if w_type == "audio_event":
+            continue
+
+        if t.strip() == "":
+            buf.append(" ")
+            continue
+
+        if start_time is None:
+            start_time = w_start
+
+        buf.append(t)
+
+        if re.search(r"[\.?!。？！…]$", t):
+            flush_segment(w_end)
+
+    if buf and words:
+        last_end = float(words[-1].get("end", 0.0))
+        flush_segment(last_end)
+
+    return segments
+
+
 def subtitles_to_video(
     audio_path: str,
-    subtitles: list[dict],
+    segments,
     video_width: int,
     video_height: int,
-    subtitle_fontsize: int,
-    subtitle_bottom_margin: int,
-    text_color: str,
+    font_size: int,
+    bottom_margin: int,
+    text_color,
     bg_color,
     max_text_width_ratio: float,
     fps: int = 30,
@@ -187,16 +198,16 @@ def subtitles_to_video(
 
     def make_frame(t):
         current_text = ""
-        for sub in subtitles:
-            if sub["start"] <= t < sub["end"]:
-                current_text = sub["text"]
+        for seg in segments:
+            if seg["start"] <= t < seg["end"]:
+                current_text = seg["text"]
                 break
         frame_img = draw_subtitle_frame(
             current_text,
             video_width,
             video_height,
-            subtitle_fontsize,
-            subtitle_bottom_margin,
+            font_size,
+            bottom_margin,
             text_color,
             bg_color,
             max_text_width_ratio,
@@ -206,8 +217,8 @@ def subtitles_to_video(
     video_clip = VideoClip(make_frame, duration=duration).set_audio(audio)
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    tmp.close()
     out_path = tmp.name
+    tmp.close()
 
     video_clip.write_videofile(
         out_path,
@@ -223,258 +234,145 @@ def subtitles_to_video(
     return out_path
 
 
-def generate_preview_image(
-    subtitles: list[dict],
-    video_width: int,
-    video_height: int,
-    subtitle_fontsize: int,
-    subtitle_bottom_margin: int,
-    text_color: str,
-    bg_color,
-    max_text_width_ratio: float,
-) -> Image.Image:
-    """
-    첫 번째 자막 문장을 이용해서 화면에 어떻게 보일지 미리보기.
-    """
-    first_text = subtitles[0]["text"] if subtitles else "미리보기"
-    return draw_subtitle_frame(
-        first_text,
-        video_width,
-        video_height,
-        subtitle_fontsize,
-        subtitle_bottom_margin,
-        text_color,
-        bg_color,
-        max_text_width_ratio,
-    )
+st.set_page_config(page_title="SubKing – ElevenLabs 자막 싱크", layout="centered")
 
-
-# =========================
-# 5. Streamlit UI
-# =========================
-st.set_page_config(page_title="SubKing - 대본 → 음성+자막 영상", layout="centered")
-
-st.title("🎬 SubKing – 대본으로 음성+자막 영상 만들기")
+st.title("🎬 SubKing – ElevenLabs로 음성+자막 영상 만들기")
 
 st.markdown(
     """
-**1단계. 대본 입력**  
-- 평소 쓰는 대본처럼 **그냥 문장 단위로** 쭉 써주세요.  
-- 줄바꿈을 해도 되고, 마침표(., ?, !) 기준으로도 자동으로 잘라서 자막을 만들어요.
+1. 대본 전체를 입력하면  
+2. ElevenLabs가 음성을 만들고  
+3. 같은 오디오를 다시 STT로 분석해서  
+4. **단어별 타임스탬프 → 문장 단위 자막**을 만듭니다.
 
-**2단계. 자막/화면 스타일과 목소리 선택**  
-- 자막 속도, 한 문장 최소 시간, 자막 위치, 글자 크기 조절  
-- 목소리(voice)와 음성 속도(speed) 선택
-
-**3단계. 자막 미리보기 → 영상 생성**
+👉 한 번에 **항상 한 문장만 화면에 표시**되도록 처리했어요.
 """
 )
 
-# ---- 대본 입력 ----
 script_text = st.text_area(
     "대본 입력",
     height=260,
-    placeholder="예)\n인류의 기술 발전은 끊임없는 탐색과 도전의 연속이었다. 그 중에서도 자율주행차라는 혁신은 다양한 가능성을 제시하며 현대 사회를 변화시키고 있다.\n특히 FSD 기술은 인간의 개입 없이 차량이 주변 환경을 인식하고 주행을 결정하는 경험을 가능하게 한다.\n...",
+    placeholder="예) 인간의 마음에는 누구나 빛나는 부분이 숨어 있다. 때로는 그 빛이 세상에 드러나지 못한 채 묻혀 있기도 하다. 우리는 그 숨은 아름다움을 함께 찾아가려 한다...",
 )
 
-# ---- 자막/화면 설정 ----
-with st.expander("⏱ 자막 타이밍 / 속도 설정", expanded=True):
-    max_chars_per_sub = st.slider(
-        "자막 한 줄에 들어갈 최대 글자 수 (자동 잘라낼 기준)",
-        min_value=12,
-        max_value=40,
-        value=28,
-        step=2,
-    )
-    chars_per_second = st.slider(
-        "초당 글자 수 (값이 클수록 자막이 빨리 넘어감)",
-        min_value=3.0,
-        max_value=20.0,
-        value=8.0,
-        step=0.5,
-    )
-    min_duration = st.slider(
-        "한 문장 최소 표시 시간 (초)",
-        min_value=0.5,
-        max_value=5.0,
-        value=1.5,
-        step=0.1,
-    )
-    gap_between_lines = st.slider(
-        "자막 사이 공백 시간 (초)",
-        min_value=0.0,
-        max_value=1.5,
-        value=0.2,
-        step=0.1,
-    )
+st.subheader("🎙 ElevenLabs 음성 설정")
 
-with st.expander("🎨 자막 스타일 / 화면 설정", expanded=False):
-    subtitle_fontsize = st.slider(
-        "자막 글자 크기",
-        min_value=30,
-        max_value=90,
-        value=60,
-        step=2,
-    )
-    subtitle_bottom_margin = st.slider(
-        "화면 아래에서 자막까지 간격 (px)",
-        min_value=100,
-        max_value=500,
-        value=280,
-        step=10,
-    )
-    max_text_width_ratio = st.slider(
-        "자막 가로 폭 비율 (화면 대비)",
-        min_value=0.5,
-        max_value=0.95,
-        value=0.8,
-        step=0.05,
-    )
+voice_id = st.text_input(
+    "Voice ID",
+    value="pNInz6obpgDQGcFmaJgB",
+    help="ElevenLabs 대시보드에서 원하는 목소리의 voice_id를 복사해서 붙여넣으세요.",
+)
 
-    text_color_name = st.selectbox(
-        "자막 색상",
-        ["white", "yellow"],
-        index=0,
-    )
+model_id = st.selectbox(
+    "TTS 모델",
+    ["eleven_multilingual_v2", "eleven_turbo_v2_5"],
+    index=0,
+)
 
-    bg_color_name = st.selectbox(
-        "배경 색상",
-        ["black", "dark_gray", "navy_like"],
-        index=0,
-    )
+voice_speed = st.slider(
+    "음성 속도 (1.0 = 기본)",
+    min_value=0.5,
+    max_value=1.5,
+    value=1.0,
+    step=0.05,
+)
 
-    if bg_color_name == "black":
-        bg_color = (0, 0, 0)
-    elif bg_color_name == "dark_gray":
-        bg_color = (20, 20, 20)
-    else:
-        bg_color = (10, 10, 40)
+st.subheader("🎨 자막 스타일")
 
-# ---- 음성 설정 ----
-with st.expander("🎙 음성(TTS) 설정", expanded=True):
-    voice_choice = st.selectbox(
-        "목소리 선택 (OpenAI TTS)",
-        [
-            "alloy",
-            "ash",
-            "ballad",
-            "coral",
-            "echo",
-            "fable",
-            "onyx",
-            "nova",
-            "sage",
-            "shimmer",
-            "verse",
-        ],
-        index=0,
-    )
-    voice_speed = st.slider(
-        "음성 속도 (1.0 = 보통)",
-        min_value=0.5,
-        max_value=1.5,
-        value=1.0,
-        step=0.05,
-    )
-    st.caption("※ 너무 빠르게 하면 발음이 부자연스러워질 수 있어요.")
+font_size = st.slider(
+    "자막 글자 크기",
+    min_value=32,
+    max_value=80,
+    value=56,
+    step=2,
+)
 
-VIDEO_WIDTH = 1080
-VIDEO_HEIGHT = 1920
+bottom_margin = st.slider(
+    "화면 아래에서 자막까지 간격 (px)",
+    min_value=120,
+    max_value=480,
+    value=260,
+    step=10,
+)
 
-col1, col2 = st.columns(2)
-preview_button = col1.button("🔍 자막 미리보기", use_container_width=True)
-generate_button = col2.button("📽 영상 생성", use_container_width=True)
+max_text_width_ratio = st.slider(
+    "자막 가로폭 비율 (화면 대비)",
+    min_value=0.5,
+    max_value=0.95,
+    value=0.8,
+    step=0.05,
+)
 
-# =========================
-# 6. 자막 미리보기
-# =========================
-if preview_button:
-    if not script_text.strip():
-        st.warning("먼저 대본을 입력해주세요.")
-    else:
-        subtitles = build_subtitles(
-            script_text,
-            chars_per_second=chars_per_second,
-            min_duration=min_duration,
-            gap_between_lines=gap_between_lines,
-            max_chars_per_sub=max_chars_per_sub,
-        )
+text_color_name = st.selectbox(
+    "자막 색상",
+    ["white", "yellow"],
+    index=0,
+)
 
-        st.markdown("### 🔍 자막 타임라인 (상위 12개)")
-        preview_rows = []
-        for sub in subtitles[:12]:
-            preview_rows.append(
-                f"{sub['index']:>2} | {sub['start']:6.2f} → {sub['end']:6.2f} | {sub['text']}"
-            )
-        st.code("\n".join(preview_rows) or "자막이 없습니다.", language="text")
+bg_color_name = st.selectbox(
+    "배경 색상",
+    ["black", "dark_gray", "navy_like"],
+    index=0,
+)
 
-        preview_img = generate_preview_image(
-            subtitles,
-            VIDEO_WIDTH,
-            VIDEO_HEIGHT,
-            subtitle_fontsize,
-            subtitle_bottom_margin,
-            text_color_name,
-            bg_color,
-            max_text_width_ratio,
-        )
-        st.image(preview_img, caption="자막 화면 미리보기 (1번째 문장 기준)", use_column_width=True)
+if bg_color_name == "black":
+    bg_color = (0, 0, 0)
+elif bg_color_name == "dark_gray":
+    bg_color = (20, 20, 20)
+else:
+    bg_color = (10, 10, 40)
 
-# =========================
-# 7. 영상 생성
-# =========================
+generate_button = st.button("📽 영상 생성", use_container_width=True)
+
 if generate_button:
     if not script_text.strip():
-        st.warning("먼저 대본을 입력해주세요.")
+        st.warning("먼저 대본을 입력해 주세요.")
         st.stop()
 
-    with st.spinner("1/3 자막 타임라인 만드는 중..."):
-        subtitles = build_subtitles(
-            script_text,
-            chars_per_second=chars_per_second,
-            min_duration=min_duration,
-            gap_between_lines=gap_between_lines,
-            max_chars_per_sub=max_chars_per_sub,
-        )
+    if not voice_id.strip():
+        st.warning("ElevenLabs Voice ID를 입력해 주세요.")
+        st.stop()
 
-    with st.spinner("2/3 음성 생성 중 (ChatGPT TTS)…"):
-        audio_path = generate_tts_audio(
-            script_text,
-            voice=voice_choice,
+    with st.spinner("1/3 ElevenLabs TTS로 음성 생성 중..."):
+        audio_path = eleven_tts_to_mp3(
+            text=script_text,
+            voice_id=voice_id.strip(),
+            model_id=model_id,
             speed=voice_speed,
         )
 
-    st.markdown("### 🔍 자막 타임라인 (상위 12개)")
-    preview_rows = []
-    for sub in subtitles[:12]:
-        preview_rows.append(
-            f"{sub['index']:>2} | {sub['start']:6.2f} → {sub['end']:6.2f} | {sub['text']}"
-        )
-    st.code("\n".join(preview_rows) or "자막이 없습니다.", language="text")
+    with st.spinner("2/3 생성된 음성으로 STT 분석 (단어별 타임스탬프 추출) 중..."):
+        words = eleven_stt_words_from_audio(audio_path, language_code="kor")
 
-    preview_img = generate_preview_image(
-        subtitles,
-        VIDEO_WIDTH,
-        VIDEO_HEIGHT,
-        subtitle_fontsize,
-        subtitle_bottom_margin,
-        text_color_name,
-        bg_color,
-        max_text_width_ratio,
-    )
-    st.image(preview_img, caption="자막 화면 미리보기 (1번째 문장 기준)", use_column_width=True)
+    if not words:
+        st.error("STT 결과에서 단어 정보를 가져오지 못했습니다. 대본/언어 설정을 확인해 주세요.")
+        st.stop()
 
-    with st.spinner("3/3 영상 렌더링 중... (조금 기다려주세요)"):
+    with st.spinner("3/3 단어 타임스탬프를 문장 자막으로 변환 & 영상 렌더링 중..."):
+        segments = build_sentence_segments_from_words(words)
+
+        if not segments:
+            st.error("단어를 문장 자막으로 변환하지 못했습니다.")
+            st.stop()
+
+        lines_preview = []
+        for seg in segments[:12]:
+            lines_preview.append(
+                f"{seg['index']:>2} | {seg['start']:6.2f} → {seg['end']:6.2f} | {seg['text']}"
+            )
+        st.markdown("### ⏱ 자막 타임라인 (상위 12문장, 항상 한 문장씩)")
+        st.code("\n".join(lines_preview), language="text")
+
         video_path = subtitles_to_video(
-            audio_path,
-            subtitles,
-            VIDEO_WIDTH,
-            VIDEO_HEIGHT,
-            subtitle_fontsize,
-            subtitle_bottom_margin,
-            text_color_name,
-            bg_color,
-            max_text_width_ratio,
+            audio_path=audio_path,
+            segments=segments,
+            video_width=VIDEO_WIDTH,
+            video_height=VIDEO_HEIGHT,
+            font_size=font_size,
+            bottom_margin=bottom_margin,
+            text_color=text_color_name,
+            bg_color=bg_color,
+            max_text_width_ratio=max_text_width_ratio,
             fps=30,
         )
 
@@ -487,6 +385,6 @@ if generate_button:
     st.download_button(
         "💾 영상 다운로드 (mp4)",
         data=video_bytes,
-        file_name="subking_output.mp4",
+        file_name="subking_elevenlabs.mp4",
         mime="video/mp4",
     )
