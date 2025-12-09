@@ -1,9 +1,7 @@
-streamlit==1.39.0
-openai>=1.51.0
-
-moviepy==1.0.3
-imageio-ffmpeg>=0.4.9
-Pillow>=10.0.0
-numpy>=1.26.0
-
-pydub>=0.25.1
+openai>=1.54.0
+streamlit
+moviepy
+imageio-ffmpeg
+pillow
+numpy
+pydub
