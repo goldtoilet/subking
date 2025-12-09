@@ -1,5 +1,3 @@
-# subking.py
-
 import os
 import re
 import tempfile
@@ -7,22 +5,25 @@ from pathlib import Path
 
 import streamlit as st
 from openai import OpenAI
-from moviepy.editor import (
-    AudioFileClip,
-    ColorClip,
-    TextClip,
-    CompositeVideoClip,
-)
+from moviepy.editor import AudioFileClip, VideoClip
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
+# =========================
+# OpenAI 설정
+# =========================
 API_KEY = os.getenv("GPT_API_KEY") or st.secrets.get("GPT_API_KEY", None)
 
 if not API_KEY:
-    st.error("GPT_API_KEY is missing.")
+    st.error("GPT_API_KEY 환경변수 또는 .streamlit/secrets.toml 에 GPT_API_KEY를 설정해주세요.")
     st.stop()
 
 client = OpenAI(api_key=API_KEY)
 
 
+# =========================
+# 자막 유틸
+# =========================
 def split_text_to_lines(text: str) -> list[str]:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if lines:
@@ -46,26 +47,22 @@ def build_subtitles(
         dur = max(min_duration, line_len / chars_per_second)
         start = current_time
         end = start + dur
-
         subtitles.append(
-            {
-                "index": idx,
-                "start": start,
-                "end": end,
-                "text": line,
-            }
+            {"index": idx, "start": start, "end": end, "text": line}
         )
         current_time = end + gap_between_lines
 
     return subtitles
 
 
+# =========================
+# TTS
+# =========================
 def generate_tts_audio(text: str) -> str:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
     tmp.close()
     out_path = Path(tmp.name)
 
-    # ✅ format 인자 삭제, 모델은 gpt-4o-mini-tts 로 변경
     with client.audio.speech.with_streaming_response.create(
         model="gpt-4o-mini-tts",
         voice="alloy",
@@ -76,65 +73,110 @@ def generate_tts_audio(text: str) -> str:
     return str(out_path)
 
 
+# =========================
+# PIL 기반 자막 렌더링
+# =========================
+def _load_font(font_size: int) -> ImageFont.FreeTypeFont:
+    try:
+        # 파이썬 기본 설치에 자주 포함되는 폰트
+        return ImageFont.truetype("DejaVuSans.ttf", font_size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _wrap_text_to_width(draw, text, font, max_width: int) -> str:
+    words = text.split()
+    if not words:
+        return ""
+
+    lines = []
+    current = words[0]
+    for w in words[1:]:
+        test = current + " " + w
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            current = test
+        else:
+            lines.append(current)
+            current = w
+    lines.append(current)
+    return "\n".join(lines)
+
+
+def draw_subtitle_frame(
+    text: str,
+    video_width: int,
+    video_height: int,
+    subtitle_fontsize: int,
+    subtitle_bottom_margin: int,
+    text_color: str,
+    bg_color,
+    max_text_width_ratio: float,
+) -> Image.Image:
+    img = Image.new("RGB", (video_width, video_height), bg_color)
+    if not text.strip():
+        return img
+
+    draw = ImageDraw.Draw(img)
+    font = _load_font(subtitle_fontsize)
+
+    max_text_width = int(video_width * max_text_width_ratio)
+    wrapped = _wrap_text_to_width(draw, text, font, max_text_width)
+
+    bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, align="center")
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    x = (video_width - text_w) // 2
+    y = video_height - subtitle_bottom_margin - text_h
+
+    draw.multiline_text((x, y), wrapped, font=font, fill=text_color, align="center")
+    return img
+
+
+# =========================
+# 자막 + 음성 → 영상
+# =========================
 def subtitles_to_video(
     audio_path: str,
     subtitles: list[dict],
-    video_width: int = 1080,
-    video_height: int = 1920,
-    subtitle_fontsize: int = 60,
-    subtitle_bottom_margin: int = 280,
-    text_color: str = "white",
-    bg_color=(0, 0, 0),
-    max_text_width_ratio: float = 0.8,
+    video_width: int,
+    video_height: int,
+    subtitle_fontsize: int,
+    subtitle_bottom_margin: int,
+    text_color: str,
+    bg_color,
+    max_text_width_ratio: float,
     fps: int = 30,
 ) -> str:
     audio = AudioFileClip(audio_path)
     duration = audio.duration
 
-    bg = ColorClip(
-        size=(video_width, video_height),
-        color=bg_color,
-    ).set_duration(duration)
-
-    text_clips = []
-    text_width = int(video_width * max_text_width_ratio)
-
-    for sub in subtitles:
-        start = sub["start"]
-        end = sub["end"]
-        line = sub["text"]
-
-        if start >= duration:
-            break
-        end = min(end, duration)
-
-        txt_clip = (
-            TextClip(
-                line,
-                fontsize=subtitle_fontsize,
-                color=text_color,
-                method="caption",
-                size=(text_width, None),
-            )
-            .set_start(start)
-            .set_end(end)
-            .set_position(
-                (
-                    "center",
-                    video_height - subtitle_bottom_margin,
-                )
-            )
+    def make_frame(t):
+        current_text = ""
+        for sub in subtitles:
+            if sub["start"] <= t < sub["end"]:
+                current_text = sub["text"]
+                break
+        frame_img = draw_subtitle_frame(
+            current_text,
+            video_width,
+            video_height,
+            subtitle_fontsize,
+            subtitle_bottom_margin,
+            text_color,
+            bg_color,
+            max_text_width_ratio,
         )
+        return np.array(frame_img)
 
-        text_clips.append(txt_clip)
-
-    video = CompositeVideoClip([bg, *text_clips]).set_audio(audio)
+    video_clip = VideoClip(make_frame, duration=duration).set_audio(audio)
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tmp.close()
     out_path = tmp.name
 
-    video.write_videofile(
+    video_clip.write_videofile(
         out_path,
         fps=fps,
         codec="libx264",
@@ -143,70 +185,95 @@ def subtitles_to_video(
         logger=None,
     )
 
-    video.close()
+    video_clip.close()
     audio.close()
-
     return out_path
 
 
-st.set_page_config(page_title="SubKing - TTS Subtitle Video", layout="centered")
+def generate_preview_image(
+    subtitles: list[dict],
+    video_width: int,
+    video_height: int,
+    subtitle_fontsize: int,
+    subtitle_bottom_margin: int,
+    text_color: str,
+    bg_color,
+    max_text_width_ratio: float,
+) -> Image.Image:
+    first_text = subtitles[0]["text"] if subtitles else "미리보기"
+    return draw_subtitle_frame(
+        first_text,
+        video_width,
+        video_height,
+        subtitle_fontsize,
+        subtitle_bottom_margin,
+        text_color,
+        bg_color,
+        max_text_width_ratio,
+    )
 
-st.title("🎬 SubKing – Text → Subtitle + Voice Video")
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="SubKing - 텍스트 → 자막+음성 영상", layout="centered")
+
+st.title("🎬 SubKing – 텍스트를 자막+음성 영상으로")
 
 st.markdown(
     """
-- Enter text (each line becomes a subtitle)
-- Adjust timing and styles
-- Generate TTS + subtitles + video
+- 한 줄이 **자막 한 줄**이 되도록 줄바꿈해서 쓰면 가장 컨트롤하기 좋아요.
+- 먼저 **자막 미리보기**로 화면 위치/스타일을 보고,
+- 그다음 **영상 생성**으로 mp4까지 만들 수 있어요.
 """
 )
 
 script_text = st.text_area(
-    "Input Text",
+    "대본 / 자막 텍스트",
     height=260,
-    placeholder="Example:\nLine1...\nLine2...\nLine3...",
+    placeholder="예)\n우리 아빠는 한 번 고장 난 하수 승강장을 여섯 주 동안 퍼 올리는 일을 했어.\n어떤 선생님이 '공부 열심히 해, 안 그러면 저 사람처럼 될 거야'라고 말한 뒤 아이들이 비웃었지.\n...",
 )
 
-with st.expander("Timing Controls", expanded=True):
+with st.expander("⏱ 자막 타이밍 / 속도 설정", expanded=True):
     chars_per_second = st.slider(
-        "Characters per second",
+        "초당 글자 수 (값이 클수록 자막이 빨리 넘어감)",
         min_value=3.0,
         max_value=20.0,
         value=8.0,
         step=0.5,
     )
     min_duration = st.slider(
-        "Minimum duration per line",
+        "한 줄 최소 표시 시간 (초)",
         min_value=0.5,
         max_value=5.0,
         value=1.5,
         step=0.1,
     )
     gap_between_lines = st.slider(
-        "Gap between subtitles",
+        "자막 사이 간격 (초)",
         min_value=0.0,
         max_value=1.5,
         value=0.2,
         step=0.1,
     )
 
-with st.expander("Style Controls", expanded=False):
+with st.expander("🎨 자막 스타일 / 화면 설정", expanded=False):
     subtitle_fontsize = st.slider(
-        "Subtitle font size",
+        "자막 글자 크기",
         min_value=30,
         max_value=90,
         value=60,
         step=2,
     )
     subtitle_bottom_margin = st.slider(
-        "Bottom margin",
+        "화면 아래에서 자막까지 간격 (px)",
         min_value=100,
         max_value=500,
         value=280,
         step=10,
     )
     max_text_width_ratio = st.slider(
-        "Text width ratio",
+        "자막 가로 폭 비율 (화면 대비)",
         min_value=0.5,
         max_value=0.95,
         value=0.8,
@@ -214,13 +281,13 @@ with st.expander("Style Controls", expanded=False):
     )
 
     text_color_name = st.selectbox(
-        "Text color",
+        "자막 색상",
         ["white", "yellow"],
         index=0,
     )
 
     bg_color_name = st.selectbox(
-        "Background color",
+        "배경 색상",
         ["black", "dark_gray", "navy_like"],
         index=0,
     )
@@ -235,17 +302,14 @@ with st.expander("Style Controls", expanded=False):
 VIDEO_WIDTH = 1080
 VIDEO_HEIGHT = 1920
 
-generate_button = st.button("Generate Video", use_container_width=True)
+col1, col2 = st.columns(2)
+preview_button = col1.button("🔍 자막 미리보기", use_container_width=True)
+generate_button = col2.button("📽 영상 생성", use_container_width=True)
 
-if generate_button:
+if preview_button:
     if not script_text.strip():
-        st.warning("Enter text first.")
-        st.stop()
-
-    with st.spinner("Generating TTS..."):
-        audio_path = generate_tts_audio(script_text)
-
-    with st.spinner("Building subtitles..."):
+        st.warning("먼저 대본 텍스트를 입력해주세요.")
+    else:
         subtitles = build_subtitles(
             script_text,
             chars_per_second=chars_per_second,
@@ -253,37 +317,84 @@ if generate_button:
             gap_between_lines=gap_between_lines,
         )
 
-    st.markdown("### Preview Subtitles")
+        st.markdown("### 🔍 자막 타임라인 (상위 10개)")
+        preview_rows = []
+        for sub in subtitles[:10]:
+            preview_rows.append(
+                f"{sub['index']:>2} | {sub['start']:6.2f} → {sub['end']:6.2f} | {sub['text']}"
+            )
+        st.code("\n".join(preview_rows) or "자막이 없습니다.", language="text")
+
+        preview_img = generate_preview_image(
+            subtitles,
+            VIDEO_WIDTH,
+            VIDEO_HEIGHT,
+            subtitle_fontsize,
+            subtitle_bottom_margin,
+            text_color_name,
+            bg_color,
+            max_text_width_ratio,
+        )
+        st.image(preview_img, caption="자막 화면 미리보기", use_column_width=True)
+
+if generate_button:
+    if not script_text.strip():
+        st.warning("먼저 대본 텍스트를 입력해주세요.")
+        st.stop()
+
+    with st.spinner("1/3 자막 타임라인 생성 중..."):
+        subtitles = build_subtitles(
+            script_text,
+            chars_per_second=chars_per_second,
+            min_duration=min_duration,
+            gap_between_lines=gap_between_lines,
+        )
+
+    with st.spinner("2/3 음성 생성 중 (ChatGPT TTS)..."):
+        audio_path = generate_tts_audio(script_text)
+
+    st.markdown("### 🔍 자막 타임라인 (상위 10개)")
     preview_rows = []
     for sub in subtitles[:10]:
         preview_rows.append(
             f"{sub['index']:>2} | {sub['start']:6.2f} → {sub['end']:6.2f} | {sub['text']}"
         )
-    st.code("\n".join(preview_rows) or "No subtitles.", language="text")
+    st.code("\n".join(preview_rows) or "자막이 없습니다.", language="text")
 
-    with st.spinner("Rendering video..."):
+    preview_img = generate_preview_image(
+        subtitles,
+        VIDEO_WIDTH,
+        VIDEO_HEIGHT,
+        subtitle_fontsize,
+        subtitle_bottom_margin,
+        text_color_name,
+        bg_color,
+        max_text_width_ratio,
+    )
+    st.image(preview_img, caption="자막 화면 미리보기", use_column_width=True)
+
+    with st.spinner("3/3 영상 렌더링 중... (조금 시간이 걸릴 수 있어요)"):
         video_path = subtitles_to_video(
             audio_path,
             subtitles,
-            video_width=VIDEO_WIDTH,
-            video_height=VIDEO_HEIGHT,
-            subtitle_fontsize=subtitle_fontsize,
-            subtitle_bottom_margin=subtitle_bottom_margin,
-            text_color=text_color_name,
-            bg_color=bg_color,
-            max_text_width_ratio=max_text_width_ratio,
+            VIDEO_WIDTH,
+            VIDEO_HEIGHT,
+            subtitle_fontsize,
+            subtitle_bottom_margin,
+            text_color_name,
+            bg_color,
+            max_text_width_ratio,
             fps=30,
         )
 
-    st.success("Video generated!")
+    st.success("영상 생성 완료!")
 
     with open(video_path, "rb") as vf:
         video_bytes = vf.read()
 
     st.video(video_bytes)
-
     st.download_button(
-        "Download Video (mp4)",
+        "💾 영상 다운로드 (mp4)",
         data=video_bytes,
         file_name="subking_output.mp4",
         mime="video/mp4",
