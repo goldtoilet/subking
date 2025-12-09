@@ -13,12 +13,14 @@ def generate_tts(text, output_path="output.mp3"):
     response = client.audio.speech.create(
         model="gpt-4o-mini-tts",
         voice="alloy",
-        input=text,
-        format="mp3"
+        input=text
     )
+
+    # 응답은 bytes
+    audio_bytes = response.read()
     with open(output_path, "wb") as f:
-        for chunk in response.iter_bytes():
-            f.write(chunk)
+        f.write(audio_bytes)
+
     return output_path
 
 
