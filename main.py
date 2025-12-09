@@ -65,11 +65,11 @@ def generate_tts_audio(text: str) -> str:
     tmp.close()
     out_path = Path(tmp.name)
 
+    # ✅ format 인자 삭제, 모델은 gpt-4o-mini-tts 로 변경
     with client.audio.speech.with_streaming_response.create(
-        model="gpt-4o-audio-preview",
+        model="gpt-4o-mini-tts",
         voice="alloy",
         input=text,
-        format="mp3",
     ) as response:
         response.stream_to_file(out_path)
 
